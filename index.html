@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>自動プレイリスト再生</title>
+<style>
+  body {
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    background: #121212;
+    color: #eee;
+    margin: 0;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; }
+  .setup {
+    background: #1e1e1e;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 20px;
+  }
+  .setup label { display: block; margin: 8px 0 4px; font-size: 13px; color: #aaa; }
+  .actions { display: flex; gap: 12px; flex-wrap: wrap; }
+  #saveBtn { background: #2a9d5c; color: #fff; }
+  #saveBtn:disabled { background: #555; color: #999; }
+  .setup input,
+  .setup select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px;
+    border-radius: 6px;
+    border: 1px solid #444;
+    background: #2a2a2a;
+    color: #fff;
+  }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  button {
+    margin-top: 12px;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 6px;
+    background: #3ea6ff;
+    color: #000;
+    font-weight: bold;
+    cursor: pointer;
+  }
+  button:disabled { background: #555; color: #999; cursor: not-allowed; }
+  #status { font-size: 13px; color: #aaa; margin-top: 8px; }
+  .player-layout {
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  #player { flex: 0 0 640px; max-width: 100%; }
+  #playlist {
+    flex: 1 1 280px;
+    min-width: 240px;
+    max-height: 360px;
+    overflow-y: auto;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  #playlist li {
+    padding: 10px;
+    border-radius: 6px;
+    margin-bottom: 6px;
+    background: #1e1e1e;
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    font-size: 14px;
+  }
+  #playlist li.playing { background: #2a4a6b; }
+  #playlist li:hover { background: #2a2a2a; }
+</style>
+</head>
+<body>
+
+<h1>アーティスト/曲を起点にした自動プレイリスト再生</h1>
+
+<div class="setup">
+  <div class="row">
+    <div>
+      <label>起点にするアーティスト名・曲名</label>
+      <input id="query" type="text" placeholder="例: Official髭男dism">
+    </div>
+    <div style="flex: 0 0 120px;">
+      <label>曲数</label>
+      <select id="count">
+        <option value="10">10曲</option>
+        <option value="20" selected>20曲</option>
+        <option value="30">30曲</option>
+        <option value="40">40曲</option>
+        <option value="50">50曲</option>
+        <option value="60">60曲</option>
+        <option value="70">70曲</option>
+        <option value="80">80曲</option>
+        <option value="90">90曲</option>
+        <option value="100">100曲</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button id="buildBtn">プレイリストを自動作成</button>
+    <button id="saveBtn" disabled>YouTube Musicにプレイリストを保存</button>
+  </div>
+  <div id="status"></div>
+</div>
+
+<div class="player-layout">
+  <div id="player"></div>
+  <ul id="playlist"></ul>
+</div>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+  const queryInput = document.getElementById('query');
+  const countInput = document.getElementById('count');
+  const buildBtn = document.getElementById('buildBtn');
+  const saveBtn = document.getElementById('saveBtn');
+  const statusEl = document.getElementById('status');
+  const playlistEl = document.getElementById('playlist');
+
+  let apiKey = '';
+  let oauthClientId = '';
+  let accessToken = null;
+  let ytPlayer = null;
+  let playlist = [];
+  let currentIndex = 0;
+
+  // config.json からAPIキー/OAuthクライアントIDを読み込む
+  const configPromise = fetch('config.json')
+    .then(res => (res.ok ? res.json() : null))
+    .then(config => {
+      if (config && config.apiKey) {
+        apiKey = config.apiKey;
+      } else {
+        statusEl.textContent = 'config.json が見つからないか、apiKeyが設定されていません。';
+      }
+      if (config && config.oauthClientId) {
+        oauthClientId = config.oauthClientId;
+      }
+    })
+    .catch(() => {
+      statusEl.textContent = 'config.json の読み込みに失敗しました。';
+    });
+
+  function loadIframeAPI() {
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.body.appendChild(tag);
+  }
+  loadIframeAPI();
+
+  window.onYouTubeIframeAPIReady = function () {
+    ytPlayer = new YT.Player('player', {
+      height: '360',
+      width: '640',
+      videoId: '',
+      events: {
+        onStateChange: onPlayerStateChange,
+      },
+    });
+  };
+
+  function onPlayerStateChange(event) {
+    if (event.data === YT.PlayerState.ENDED) {
+      playNext();
+    }
+  }
+
+  function renderPlaylist() {
+    playlistEl.innerHTML = '';
+    playlist.forEach((item, i) => {
+      const li = document.createElement('li');
+      li.textContent = item.title;
+      if (i === currentIndex) li.classList.add('playing');
+      li.addEventListener('click', () => playAt(i));
+      playlistEl.appendChild(li);
+    });
+  }
+
+  function playAt(index) {
+    if (!playlist[index] || !ytPlayer) return;
+    currentIndex = index;
+    ytPlayer.loadVideoById(playlist[index].videoId);
+    renderPlaylist();
+  }
+
+  function playNext() {
+    if (currentIndex + 1 < playlist.length) {
+      playAt(currentIndex + 1);
+    }
+  }
+
+  async function searchYouTubePage(apiKey, query, maxResults, pageToken) {
+    const url = new URL('https://www.googleapis.com/youtube/v3/search');
+    url.searchParams.set('part', 'snippet');
+    url.searchParams.set('type', 'video');
+    url.searchParams.set('videoCategoryId', '10');
+    url.searchParams.set('q', query);
+    url.searchParams.set('maxResults', String(Math.min(maxResults, 50)));
+    url.searchParams.set('key', apiKey);
+    if (pageToken) {
+      url.searchParams.set('pageToken', pageToken);
+    }
+
+    const res = await fetch(url);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error?.message || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    const items = data.items
+      .filter(item => item.id && item.id.videoId)
+      .map(item => ({
+        videoId: item.id.videoId,
+        title: item.snippet.title,
+      }));
+    return { items, nextPageToken: data.nextPageToken };
+  }
+
+  // maxResultsが50を超える場合はページネーションして複数回リクエストする
+  async function searchYouTube(apiKey, query, totalNeeded) {
+    const results = [];
+    let pageToken;
+
+    while (results.length < totalNeeded) {
+      const remaining = totalNeeded - results.length;
+      const { items, nextPageToken } = await searchYouTubePage(apiKey, query, remaining, pageToken);
+      results.push(...items);
+
+      if (!nextPageToken || items.length === 0) break;
+      pageToken = nextPageToken;
+    }
+
+    return results;
+  }
+
+  buildBtn.addEventListener('click', async () => {
+    await configPromise;
+
+    const query = queryInput.value.trim();
+    const count = parseInt(countInput.value, 10) || 20;
+
+    if (!apiKey) {
+      statusEl.textContent = 'APIキーが読み込まれていません。config.json を確認してください。';
+      return;
+    }
+    if (!query) {
+      statusEl.textContent = 'アーティスト名や曲名を入力してください。';
+      return;
+    }
+
+    buildBtn.disabled = true;
+    statusEl.textContent = '検索中...';
+
+    try {
+      const seedResults = await searchYouTube(apiKey, `${query} 公式`, 1);
+      const relatedResults = await searchYouTube(apiKey, `${query}`, count + 5);
+
+      const seen = new Set();
+      const combined = [...seedResults, ...relatedResults].filter(item => {
+        if (seen.has(item.videoId)) return false;
+        seen.add(item.videoId);
+        return true;
+      });
+
+      playlist = combined.slice(0, count);
+      currentIndex = 0;
+
+      if (playlist.length === 0) {
+        statusEl.textContent = '該当する曲が見つかりませんでした。';
+        saveBtn.disabled = true;
+      } else {
+        statusEl.textContent = `${playlist.length}曲のプレイリストを作成しました。`;
+        renderPlaylist();
+        saveBtn.disabled = false;
+        if (ytPlayer && ytPlayer.loadVideoById) {
+          playAt(0);
+        }
+      }
+    } catch (e) {
+      statusEl.textContent = 'エラー: ' + e.message;
+    } finally {
+      buildBtn.disabled = false;
+    }
+  });
+
+  function getAccessToken() {
+    return new Promise((resolve, reject) => {
+      if (!oauthClientId) {
+        reject(new Error('config.json に oauthClientId が設定されていません。'));
+        return;
+      }
+      if (!window.google || !google.accounts || !google.accounts.oauth2) {
+        reject(new Error('Google認証ライブラリの読み込みに失敗しました。時間をおいて再読み込みしてください。'));
+        return;
+      }
+      const client = google.accounts.oauth2.initTokenClient({
+        client_id: oauthClientId,
+        scope: 'https://www.googleapis.com/auth/youtube',
+        callback: (response) => {
+          if (response.error) {
+            reject(new Error(response.error));
+            return;
+          }
+          accessToken = response.access_token;
+          resolve(accessToken);
+        },
+      });
+      client.requestAccessToken({ prompt: accessToken ? '' : 'consent' });
+    });
+  }
+
+  async function createRemotePlaylist(token, title, videoIds, onProgress) {
+    const playlistRes = await fetch('https://www.googleapis.com/youtube/v3/playlists?part=snippet,status', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        snippet: { title, description: `「${title}」を起点に自動生成` },
+        status: { privacyStatus: 'private' },
+      }),
+    });
+    if (!playlistRes.ok) {
+      const err = await playlistRes.json().catch(() => ({}));
+      throw new Error(err.error?.message || `プレイリスト作成に失敗しました (HTTP ${playlistRes.status})`);
+    }
+    const playlistData = await playlistRes.json();
+    const playlistId = playlistData.id;
+
+    let added = 0;
+    for (const videoId of videoIds) {
+      const itemRes = await fetch('https://www.googleapis.com/youtube/v3/playlistItems?part=snippet', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          snippet: {
+            playlistId,
+            resourceId: { kind: 'youtube#video', videoId },
+          },
+        }),
+      });
+      if (itemRes.ok) {
+        added += 1;
+      }
+      onProgress(added, videoIds.length);
+    }
+
+    return { playlistId, added };
+  }
+
+  saveBtn.addEventListener('click', async () => {
+    if (playlist.length === 0) {
+      statusEl.textContent = '先に「プレイリストを自動作成」を実行してください。';
+      return;
+    }
+
+    await configPromise;
+    saveBtn.disabled = true;
+    buildBtn.disabled = true;
+    statusEl.textContent = 'Googleアカウントの認証中...';
+
+    try {
+      const token = await getAccessToken();
+      const title = queryInput.value.trim() ? `${queryInput.value.trim()} おすすめ` : '自動生成プレイリスト';
+
+      statusEl.textContent = 'YouTube Musicにプレイリストを作成中... (0/' + playlist.length + ')';
+      const { playlistId, added } = await createRemotePlaylist(
+        token,
+        title,
+        playlist.map(p => p.videoId),
+        (done, total) => {
+          statusEl.textContent = `YouTube Musicにプレイリストを作成中... (${done}/${total})`;
+        }
+      );
+
+      statusEl.innerHTML =
+        `YouTube Musicにプレイリストを作成しました(${added}/${playlist.length}曲)。` +
+        `<br><a href="https://music.youtube.com/playlist?list=${playlistId}" target="_blank" style="color:#3ea6ff;">` +
+        `プレイリストを開く</a>`;
+    } catch (e) {
+      statusEl.textContent = 'エラー: ' + e.message;
+    } finally {
+      saveBtn.disabled = false;
+      buildBtn.disabled = false;
+    }
+  });
+</script>
+
+</body>
+</html>
